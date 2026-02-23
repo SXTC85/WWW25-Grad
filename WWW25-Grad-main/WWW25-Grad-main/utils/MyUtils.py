@@ -1,12 +1,12 @@
 import os
 import torch
-import dgl
+#import dgl
 import matplotlib.pyplot as plt
 
 import GPUtil
         
 
-def pyg_data_to_dgl_graph(pyg_data_obj):
+'''def pyg_data_to_dgl_graph(pyg_data_obj):
     """
     将PyTorch Geometric的Data对象转换为DGL的Graph对象。
     
@@ -53,7 +53,7 @@ def pyg_data_to_dgl_graph(pyg_data_obj):
         g.ndata['val_mask'] = pyg_data_obj.val_mask
 
     
-    return g
+    return g '''
 
 def get_gpu_memory_usage():
     # 获取GPU使用情况

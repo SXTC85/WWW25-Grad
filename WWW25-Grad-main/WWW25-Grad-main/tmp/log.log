@@ -1,0 +1,11 @@
+Logging to tmp/
+creating model and diffusion...
+start training loop...
+------------------------
+| grad_norm | 0.557    |
+| loss      | 0.975    |
+| mse       | 0.975    |
+| samples   | 2        |
+| step      | 0        |
+------------------------
+saving model 0...

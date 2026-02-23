@@ -1,7 +1,7 @@
 from utils.MyUtils import color_print
 from utils.args import argVar
 from utils.dataProcess import loadDataset, nodeSelect, nodeSample, sampleCheck
-from models.SupGCL import SupGCL
+#from models.SupGCL import SupGCL
 # my part
 from models.GuiDDPM import GuiDDPM
 
@@ -39,8 +39,8 @@ def GuiDDPM_module(args, graph_pyg_supgcl, node_groups, edge_index_unselected, g
         syn_relation_filename = f"./Generation/SynRelation_{args.dataset}_{args.GuiDDPM_sample_diffusion_steps}Samplesteps_{args.GuiDDPM_train_steps}Trainsteps_subgraphsize_{args.nodes_per_subgraph}_unguided.pt"
 
     model_DDPM=GuiDDPM(global_args=args,
-                      graph_pyg_supgcl=graph_pyg_supgcl,
-                      node_groups=node_groups, 
+                      node_groups=node_groups,
+                      graph_pyg_ssupgcl=graph_pyg_supgcl,
                       edge_index_unselected=edge_index_unselected,
                       guidance=guidance, 
                       train_flag=args.GuiDDPM_train_flag, 
@@ -81,16 +81,25 @@ def main():
     # prepare data
     graph_dgl, graph_pyg, train_mask, val_mask, test_mask = loadDataset(dataset=args.dataset, train_ratio=args.train_ratio)
 
-    edge_types = graph_dgl.canonical_etypes
+    # 对标任务书：DGraph-Fin 作为同质图，不需要 DGL 的多关系处理
+    if graph_dgl is not None:
+        edge_types = graph_dgl.canonical_etypes
+    else:
+        # 手动定义一个默认的边类型，让程序能继续往下跑
+        edge_types = [('node', 'edge', 'node')]
 
     print(graph_pyg.y[train_mask].sum(),graph_pyg.y[val_mask].sum(),graph_pyg.y[test_mask].sum())
 
-    graph_pyg_selected, edge_index_unselected=nodeSelect(graph_pyg=graph_pyg, nodes_per_subgraph=32)
+    # 修改后：
+    graph_pyg_selected, edge_index_unselected = nodeSelect(graph_pyg=graph_pyg,
+                                                           nodes_per_subgraph=args.nodes_per_subgraph)
 
     # Supervised graph contrastive learning (SupGCL)
-    graph_pyg_supgcl, model_SupGCL=SupGCL_module(args=args,
-                                            graph_pyg=graph_pyg,
-                                            graph_pyg_selected=graph_pyg_selected)
+    #graph_pyg_supgcl, model_SupGCL=SupGCL_module(args=args,graph_pyg=graph_pyg,graph_pyg_selected=graph_pyg_selected)
+
+    # 2. 直接赋值，实现快速跳转
+    graph_pyg_supgcl = graph_pyg
+    model_SupGCL = None
 
     # node sample
     node_groups=nodeSample(graph_pyg=graph_pyg_supgcl, nodes_per_subgraph=args.nodes_per_subgraph)
@@ -103,7 +112,7 @@ def main():
                    graph_pyg_supgcl=graph_pyg_supgcl,
                    node_groups=node_groups,
                    edge_index_unselected=edge_index_unselected, 
-                   guidance=model_SupGCL)
+                   guidance=None)
     
     # Weighted Filter
     

@@ -7,7 +7,30 @@ import os
 import socket
 
 import blobfile as bf
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    # 针对 Windows CPU 环境的伪装逻辑
+    # 只要让程序认为当前只有 1 个进程在跑即可
+    # 找到 class MockMPI 并替换成这段：
+    class MockMPI:
+        def __init__(self):
+            self.COMM_WORLD = self
+            self.rank = 0
+            self.size = 1
+
+        def Get_rank(self):
+            return 0
+
+        def Get_size(self):
+            return 1
+
+        def barrier(self):
+            pass
+
+        def bcast(self, val, root=0):
+            return val
+
 import torch as th
 import torch.distributed as dist
 
@@ -20,25 +43,17 @@ SETUP_RETRY_COUNT = 3
 
 def setup_dist():
     """
-    Setup a distributed process group.
+    针对 Windows CPU 调试环境的终极简化：
+    彻底跳过 init_process_group，防止 libuv 报错。
     """
-    if dist.is_initialized():
-        return
+    import os
+    # 设置基础环境变量，防止其他地方调用时报错
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
 
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
-
-    if backend == "gloo":
-        hostname = "localhost"
-    else:
-        hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
-
-    port = comm.bcast(_find_free_port(), root=0)
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend=backend, init_method="env://")
+    print("已绕过 Distributed 初始化，进入单机调试模式。")
 
 
 def dev():

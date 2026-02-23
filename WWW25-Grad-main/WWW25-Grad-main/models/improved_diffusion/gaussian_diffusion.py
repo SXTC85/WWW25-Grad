@@ -229,35 +229,14 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
-    ):
-        """
-        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
-        the initial x, x_0.
-
-        :param model: the model, which takes a signal and a batch of timesteps
-                      as input.
-        :param x: the [N x C x ...] tensor at time t.
-        :param t: a 1-D Tensor of timesteps.
-        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
-        :param denoised_fn: if not None, a function which applies to the
-            x_start prediction before it is used to sample. Applies before
-            clip_denoised.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :return: a dict with the following keys:
-                 - 'mean': the model mean output.
-                 - 'variance': the model variance output.
-                 - 'log_variance': the log of 'variance'.
-                 - 'pred_xstart': the prediction for x_0.
-        """
+    def p_mean_variance(self, model, x, t, edge_index=None, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         if model_kwargs is None:
             model_kwargs = {}
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        # 【关键修改】：注入图结构 edge_index
+        model_output = model(x, self._scale_timesteps(t), edge_index=edge_index, **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -404,6 +383,7 @@ class GaussianDiffusion:
         model,
         x,
         t,
+        edge_index=None,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -431,6 +411,7 @@ class GaussianDiffusion:
             model,
             x,
             t,
+            edge_index=edge_index,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
@@ -450,6 +431,7 @@ class GaussianDiffusion:
         self,
         model,
         shape,
+        edge_index=None,
         noise=None,
         clip_denoised=True,
         denoised_fn=None,
@@ -482,6 +464,7 @@ class GaussianDiffusion:
         for sample in self.p_sample_loop_progressive(
             model,
             shape,
+            edge_index=edge_index,
             noise=noise,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
@@ -498,6 +481,7 @@ class GaussianDiffusion:
         self,
         model,
         shape,
+        edge_index=None,
         noise=None,
         clip_denoised=True,
         denoised_fn=None,
@@ -537,6 +521,7 @@ class GaussianDiffusion:
                     model,
                     img,
                     t,
+                    edge_index=edge_index,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
@@ -551,6 +536,7 @@ class GaussianDiffusion:
         model,
         x,
         t,
+        edge_index=None,
         clip_denoised=True,
         denoised_fn=None,
         cond_fn=None,
@@ -567,6 +553,7 @@ class GaussianDiffusion:
             model,
             x,
             t,
+            edge_index=edge_index,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
@@ -758,7 +745,14 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, edge_index=None, model_kwargs=None, noise=None):
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise=noise)
+
+        terms = {}
         """
         Compute training losses for a single timestep.
 
@@ -771,13 +765,7 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
-        if model_kwargs is None:
-            model_kwargs = {}
-        if noise is None:
-            noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)
 
-        terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
@@ -791,7 +779,8 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+                # 【关键修改】：模型现在需要根据图结构预测噪声
+            model_output = model(x_t, self._scale_timesteps(t), edge_index=edge_index, **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
