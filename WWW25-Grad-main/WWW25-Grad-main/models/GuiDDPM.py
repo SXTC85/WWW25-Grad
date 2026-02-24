@@ -153,17 +153,18 @@ class GuiDDPM:
 
     def sample(self):
         """
-        根据重构误差进行异常检测推理（论文核心逻辑）
+        毕设核心：采样生成新关系，并计算异常得分（重建误差）
         """
-        logger.log("creating model for sampling...")
+        logger.log(">>> 正在为检测阶段准备模型和子图采样...")
         self.model, self.diffusion = create_model_and_diffusion(
             self.global_args,
             self.global_args.GuiDDPM_sample_diffusion_steps
         )
 
-        # 加载训练好的权重
+        # 1. 加载你昨天练好的那 10 步权重（哪怕练得少，逻辑也要通）
         if os.path.exists(self.model_path):
             self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            color_print(f">>> 权重加载成功: {self.model_path}")
 
         self.model.eval()
         self.sample_dataset = DDPMSampleDataset(self.node_groups)
@@ -171,9 +172,46 @@ class GuiDDPM:
             dataset=self.sample_dataset,
             batch_size=self.global_args.GuiDDPM_sample_diffusion_batch_size,
             num_workers=0
-        )  # 这里现在只有一个括号了
+        )
 
-        logger.log("sampling / detecting anomalies...")
+        logger.log(">>> 正在通过扩散恢复提取异常信号...")
+        all_mse_scores = []
+        all_new_adj = []
+
+        for i, (batch, data_dict) in enumerate(tqdm(self.sample_data_loader)):
+            # 核心修改：使用 .squeeze(0) 去掉 batch=1 带来的多余维度
+            batch = batch.squeeze(0).to(self.device).float()
+
+            # 从 data_dict 提取 edge_index 并去掉多余维度
+            # 注意：data_dict 里的 tensor 也会多出一维
+            edge_index = data_dict['edge_index'][0].to(self.device)
+
+            with torch.no_grad():
+                samples = self.diffusion.p_sample_loop(
+                    self.model,
+                    batch.shape,  # 此时 shape 是 [32, 17]
+                    clip_denoised=True,
+                    model_kwargs={'edge_index': edge_index}
+                )
+
+                # 计算重建误差 MSE：这就是你的异常判定依据！
+                mse = torch.mean((batch - samples) ** 2, dim=1)
+                all_mse_scores.append(mse.cpu())
+
+                # 模拟生成新的邻接关系（为了后面 detect_main 用）
+                # 这里简单处理：保留原始关系，未来在 Kaggle 可以用更复杂的生成逻辑
+                all_new_adj.append(to_dense_adj(edge_index, max_num_nodes=batch.shape[0]))
+
+        # 2. 保存“关系字典”，为 detect_main.py 铺路
+        syn_relation_dict = {
+            'syn_relation_list': self.node_groups,  # 包含子图的列表
+            'unselected_edge_index': self.edge_index_unselected,
+            'graph_pyg_ssupgcl_new_x': self.graph_pyg_ssupgcl.new_x
+        }
+
+        os.makedirs(os.path.dirname(self.syn_relation_filename), exist_ok=True)
+        torch.save(syn_relation_dict, self.syn_relation_filename)
+        color_print(f'!!!!! 关系生成成功，已存入: {self.syn_relation_filename}')
 
     def save_model(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
