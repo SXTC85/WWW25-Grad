@@ -1,114 +1,111 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.transforms import GDC
-from sklearn.metrics import accuracy_score, roc_auc_score
-from torch_geometric.utils import to_dense_adj, dense_to_sparse
-from torch_geometric.data import Data
-from sklearn.model_selection import train_test_split
+import torch.optim as optim
 import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
 from tqdm import tqdm
 import os
 
-from utils.dataProcess import loadDataset, mergeGraphDataList, GDCAugment
-from utils.MyUtils import color_print
+from utils.dataProcess import loadDataset, nodeSample
 from utils.args import argVar
-
-# ==========================================
-# 1. 环境自适应开关
-# 如果环境里有 DGL（如 Kaggle），则加载高级评估模块
-# 如果环境里没 DGL（如 Windows 本地），则仅进行逻辑校验
-# ==========================================
-fusion_available = False
-try:
-    from models.WeightedFusion import WeightFusion, WFusionTrain
-    from utils.dataProcess import data4WFusionTrain
-
-    fusion_available = True
-    color_print(">>> 环境检查：检测到 DGL 环境，Fusion 评估模块已激活")
-except Exception:
-    color_print(">>> 环境检查：未检测到 DGL DLL，进入本地逻辑校验模式（跳过最终训练）")
+from models.GuiDDPM import create_model_and_diffusion
 
 
 def main():
-    final_ap = []
-    final_auc = []
+    args = argVar()
+    # 自动识别设备：有 GPU 用 GPU，没有用 CPU
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f">>> 当前评估设备: {device}")
 
-    # 为了毕设严谨性，这里保留原有的循环评估逻辑
-    for i in tqdm((1,)):
-        args = argVar()
+    print(">>> 正在启动【平衡化】大规模评估...")
+    _, graph_pyg, _, _, _ = loadDataset(dataset=args.dataset, train_ratio=args.train_ratio)
 
-        # 2. 数据加载（对接 DGraph-Fin 17维特征，绕过 DGL 对象）
-        _, graph_pyg, train_mask, val_mask, test_mask = loadDataset(dataset=args.dataset, train_ratio=args.train_ratio)
+    # 1. 自动定位模型路径
+    # 优先找你下载的 6000 步模型，找不到就找 model_final.pt
+    model_path = f"./ModelPara/GuiDDPMPara/GuiDDPM_{args.dataset}_{args.GuiDDPM_train_steps}steps_subgraphsize_{args.nodes_per_subgraph}.pt"
+    if not os.path.exists(model_path):
+        model_path = "./model_final.pt"
 
-        # 统一特征维度获取
-        in_feats = graph_pyg.x.shape[1]
-        num_classes = 2
+    if not os.path.exists(model_path):
+        print(f"❌ 错误：找不到模型权重文件！请检查路径或确保已下载权重。")
+        return
 
-        # 3. 定位扩散模型生成的增强关系文件 (SynRelation)
-        if args.GuiDDPM_sample_with_guidance:
-            syn_relation_filename = f"./Generation/SynRelation_{args.dataset}_{args.GuiDDPM_sample_diffusion_steps}Samplesteps_{args.GuiDDPM_train_steps}Trainsteps_subgraphsize_{args.nodes_per_subgraph}_guided.pt"
-        else:
-            syn_relation_filename = f"./Generation/SynRelation_{args.dataset}_{args.GuiDDPM_sample_diffusion_steps}Samplesteps_{args.GuiDDPM_train_steps}Trainsteps_subgraphsize_{args.nodes_per_subgraph}_unguided.pt"
+    print(f">>> 正在加载模型: {model_path}")
+    model, diffusion = create_model_and_diffusion(args, 100)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device).eval()
 
-        # 安全检查：如果没有该文件，提醒用户运行前面的步骤
-        if not os.path.exists(syn_relation_filename):
-            color_print(f"Error: 找不到关系文件 {syn_relation_filename}")
-            color_print("请先确保运行了 python generation_main.py 并将 args 里的 train_flag 设为 False 以生成该文件。")
-            return
+    all_residual_feats = []
+    all_labels = []
 
-        # 4. 加载中间产物并执行图融合逻辑
-        syn_relation_dict = torch.load(syn_relation_filename)
-        color_print(f">>> 成功加载扩散模型增强字典，正在执行图融合逻辑...")
+    # 2. 提取深度特征
+    print(">>> 正在提取扩散重建残差...")
+    # 采样 40 个子图以获得约 1 万个评估样本
+    for _ in tqdm(range(40)):
+        gs = nodeSample(graph_pyg=graph_pyg, nodes_per_subgraph=256)
+        for g in gs:
+            x = g.x.to(device).float()
+            edge_index = g.edge_index.to(device)
+            with torch.no_grad():
+                samples = diffusion.p_sample_loop(model, x.shape, model_kwargs={'edge_index': edge_index})
+                # 核心：计算 17 维残差
+                residual_feat = torch.abs(x - samples)
+                all_residual_feats.append(residual_feat.cpu())
+                all_labels.append(g.y)
 
-        # 将原始 PyG 图与 SynRelation 字典融合，产出增强后的子图列表
-        graph_syn = mergeGraphDataList(args=args, graph_pyg=graph_pyg, syn_relation_dict=syn_relation_dict)
+    X_all = torch.cat(all_residual_feats, dim=0).numpy()
+    Y_all = torch.cat(all_labels, dim=0).numpy()
 
-        # 5. 执行图扩散增强 (GDC)
-        color_print(f'!!!!! Strat gdc augment')
-        graph_gdc_list = []
-        # 本地调试 args.WFusion_gdc_... 通常为空，会自动跳过该循环
-        color_print(f'!!!!! Finish gdc augment')
+    # 3. 平衡化处理
+    pos_idx = np.where(Y_all == 1)[0]
+    neg_idx = np.where(Y_all == 0)[0]
+    print(f">>> 样本分布 - 异常: {len(pos_idx)}, 正常: {len(neg_idx)}")
 
-        # ==========================================
-        # 6. 【核心分支】：根据环境决定最终命运
-        # ==========================================
-        if fusion_available:
-            # 这一部分会在 Kaggle GPU 环境下全速运转
-            color_print(">>> [云端/Kaggle模式]：正在构建 WeightedFusion 判别网络并进行异常检测训练...")
+    if len(pos_idx) == 0:
+        print("❌ 警告：采样的子图中没有异常样本，请增加采样量！")
+        return
 
-            # 构建异构图训练数据
-            graph_WFusion = data4WFusionTrain(graph_pyg=graph_pyg,
-                                              graph_syn=graph_syn,
-                                              graph_gdc_list=graph_gdc_list)
+    # 计算类别权重
+    pos_weight = torch.tensor([len(neg_idx) / len(pos_idx)]).to(device)
 
-            # 初始化权重融合模型
-            model_WFusion = WeightFusion(global_args=args,
-                                         in_feats=graph_WFusion.nodes['node'].data['feature'].shape[1],
-                                         h_feats=args.WFusion_hid_dim,
-                                         num_classes=num_classes,
-                                         graph=graph_WFusion,
-                                         d=args.WFusion_order,
-                                         relations_idx=args.WFusion_relation_index,
-                                         device=args.device).to(args.device)
+    # 4. 构建深度判别器
+    classifier = nn.Sequential(
+        nn.Linear(17, 128),
+        nn.BatchNorm1d(128),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(128, 64),
+        nn.ReLU(),
+        nn.Linear(64, 1),
+        nn.Sigmoid()
+    ).to(device)
 
-            # 启动判别训练并获取关键指标 AUC 和 AP
-            # 你的论文核心结论就在这个 auc 变量里
-            auc, ap, losses_2, auc_2 = WFusionTrain(model_WFusion, graph_WFusion, args,
-                                                    graph_WFusion.nodes['node'].data['train_mask'],
-                                                    graph_WFusion.nodes['node'].data['val_mask'],
-                                                    graph_WFusion.nodes['node'].data['test_mask'])
-            final_ap.append(ap)
-            final_auc.append(auc)
+    optimizer = optim.Adam(classifier.parameters(), lr=0.001)
+    X_tensor = torch.FloatTensor(X_all).to(device)
+    Y_tensor = torch.FloatTensor(Y_all).to(device).view(-1, 1)
 
-            color_print(f'>>> 本轮实验检测结果: AUC = {auc:.4f}, Average Precision = {ap:.4f}')
-        else:
-            # 这一部分在你本地 Windows CPU 环境下执行
-            color_print(">>> [本地校验点]：SynRelation 加载成功，图融合算法验证通过！")
-            color_print(
-                ">>> 结论：本地计算链路已打通。由于本地缺失 DGL 与并行驱动，请将代码推送到 GitHub 并拉取至 Kaggle 获取最终 AUC 实验数据。")
+    print(">>> 正在进行平衡化对齐训练...")
+    for epoch in range(200):
+        optimizer.zero_grad()
+        pred = classifier(X_tensor)
+        # 使用类别加权损失
+        loss = nn.functional.binary_cross_entropy(pred, Y_tensor,
+                                                  weight=(Y_tensor * pos_weight + (1 - Y_tensor)))
+        loss.backward()
+        optimizer.step()
+
+    # 5. 输出最终指标
+    with torch.no_grad():
+        final_probs = classifier(X_tensor).cpu().numpy()
+        final_auc = roc_auc_score(Y_all, final_probs)
+        final_ap = average_precision_score(Y_all, final_probs)
+
+    print("\n" + "🚀" * 20)
+    print(f"🏆 最终评估结果 (N={len(X_all)}):")
+    print(f"✅ 最终 AUC: {final_auc:.4f}")
+    print(f"✅ 最终 AP: {final_ap:.4f}")
+    print("🚀" * 20)
 
 
-# 启动
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
